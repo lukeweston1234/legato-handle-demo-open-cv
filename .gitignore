@@ -1,0 +1,7 @@
+/target
+
+# autogenereated by direnv
+.direnv/
+.venv/
+models/
+__pycache__/

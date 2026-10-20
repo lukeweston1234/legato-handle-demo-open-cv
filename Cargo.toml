@@ -1,0 +1,9 @@
+[package]
+name = "legato-hand-tracking"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cpal = "0.18.2"
+legato = "0.2.0"
+rtrb = "0.4.0"
