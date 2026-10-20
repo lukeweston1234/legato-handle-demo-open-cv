@@ -289,6 +289,9 @@ pub struct Shared {
     pads: [[AtomicF32; 2]; PADS],
     /// Bumped by the viewer to play a pad without a hand.
     auditions: [AtomicU32; PADS],
+    /// Pads held down from the viewer's keyboard, one bit each: a second set
+    /// of fingers that gate just like the real ones.
+    held: AtomicU32,
 
     len: AtomicF32,
     playing: AtomicBool,
@@ -335,6 +338,15 @@ impl Shared {
     /// Play `pad` once, as if a finger tapped it.
     pub fn audition(&self, pad: usize) {
         self.auditions[pad].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Mark which pads the keyboard is holding, bit `n` for pad `n`.
+    pub fn set_held(&self, mask: u32) {
+        self.held.store(mask, Ordering::Relaxed);
+    }
+
+    pub fn held(&self, pad: usize) -> bool {
+        self.held.load(Ordering::Relaxed) & (1 << pad) != 0
     }
 
     /// How many times each pad has been auditioned; the slicer watches for changes.
@@ -538,5 +550,8 @@ mod tests {
         shared.audition(3);
         shared.audition(3);
         assert_eq!(shared.auditions(), [0, 0, 0, 2]);
+
+        shared.set_held(0b0100);
+        assert!(shared.held(2) && !shared.held(1));
     }
 }

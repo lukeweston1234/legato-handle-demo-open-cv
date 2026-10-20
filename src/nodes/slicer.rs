@@ -39,6 +39,7 @@ const INPUTS: [&str; 13] = [
 /// dragged along by its neighbour doesn't steal the slice.
 ///
 /// - `gate0..3` fire a pad on the rising edge and keep it looping while high.
+///   A key held in the viewer gates its pad the same way.
 ///   Once released, it finishes the cycle it is on, so a quick tap still
 ///   plays the whole slice.
 /// - `vel0..3` scale the pad, latched when it fires. Unconnected means full.
@@ -212,6 +213,7 @@ impl Slicer {
 
         // An audition is a tap at full velocity, quantized like any other.
         let auditions = self.shared.auditions();
+        let keys: [bool; PADS] = std::array::from_fn(|pad| self.shared.held(pad));
         for (pad, (now, heard)) in auditions.iter().zip(&mut self.heard).enumerate() {
             if std::mem::replace(heard, *now) != *now {
                 self.pending = Some((pad, 1.0));
@@ -238,9 +240,15 @@ impl Slicer {
             };
 
             for (pad, was) in self.gates.iter_mut().enumerate() {
-                let gate = at(port::GATE + pad, 0.0) >= 0.5;
+                let finger = at(port::GATE + pad, 0.0) >= 0.5;
+                let gate = finger || keys[pad];
                 if gate && !*was {
-                    let vel = at(port::VEL + pad, 1.0).clamp(0.0, 1.0);
+                    // A key has no velocity of its own; play it full.
+                    let vel = if finger {
+                        at(port::VEL + pad, 1.0).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
                     if self.pending.is_none_or(|(_, waiting)| vel >= waiting) {
                         self.pending = Some((pad, vel));
                     }
@@ -615,6 +623,27 @@ mod tests {
         assert!(
             render(node, &buffer, &[]).iter().all(|&y| y == 0.0),
             "only once"
+        );
+    }
+
+    #[test]
+    fn a_held_key_loops_like_a_finger() {
+        let node = &mut slicer();
+        let buffer = ramp(1000);
+        node.shared.set_held(0b0010);
+        let out = render(node, &buffer, &[]);
+        assert_eq!(out[0], 116.0);
+        assert_eq!(out[40], 116.0 + 8.0, "still looping");
+
+        // Pinching while held shortens the loop: 4 to 16 samples, halfway is 8.
+        let out = render(node, &buffer, &[(port::LEN, &[0.5; BLOCK])]);
+        assert!(out.iter().all(|&y| (116.0..124.0).contains(&y)));
+
+        node.shared.set_held(0);
+        render(node, &buffer, &[]);
+        assert!(
+            render(node, &buffer, &[]).iter().all(|&y| y == 0.0),
+            "stops once let go"
         );
     }
 

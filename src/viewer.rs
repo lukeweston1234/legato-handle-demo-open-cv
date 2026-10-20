@@ -217,7 +217,7 @@ impl Viewer {
                     }
                     if ui
                         .button("▶")
-                        .on_hover_text("Play the selected slice (or press 1–4)")
+                        .on_hover_text("Play the selected slice. Keys 1–4 (or space) play like fingers: hold to loop")
                         .clicked()
                     {
                         play = Some(*selected);
@@ -593,17 +593,28 @@ impl eframe::App for Viewer {
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::S)) {
             self.save();
         }
+        // Keys 1–4 (and space, for the selected pad) are fingers: held, the
+        // slice loops, so the right hand can play with it.
+        let mut held = 0;
         if !ui.ctx().egui_wants_keyboard_input() {
             let keys = [Key::Num1, Key::Num2, Key::Num3, Key::Num4];
             for (pad, key) in keys.into_iter().enumerate() {
-                if ui.input(|i| i.key_pressed(key)) {
-                    self.audition(pad);
+                let (pressed, down) = ui.input(|i| (i.key_pressed(key), i.key_down(key)));
+                if pressed {
+                    self.selected = pad;
+                }
+                if down {
+                    held |= 1 << pad;
+                } else if pressed {
+                    // Down and up within one frame: still a tap.
+                    self.shared.audition(pad);
                 }
             }
-            if ui.input(|i| i.key_pressed(Key::Space)) {
-                self.audition(self.selected);
+            if ui.input(|i| i.key_down(Key::Space)) {
+                held |= 1 << self.selected;
             }
         }
+        self.shared.set_held(held);
 
         egui::Panel::top("header").show(ui, |ui| {
             ui.add_space(4.0);
