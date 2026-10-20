@@ -25,10 +25,18 @@
             libice
             fontconfig
             freetype
+            # The viewer's winit + glow, which dlopen these too.
+            wayland
+            libxkbcommon
+            libxcursor
+            libxrandr
+            libxi
           ];
         in {
           default = pkgs.mkShell {
-            packages = with pkgs; [ rustc cargo clippy rustfmt rust-analyzer uv python ];
+            packages = with pkgs; [ rustc cargo clippy rustfmt rust-analyzer uv python ffmpeg ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux (with pkgs; [ alsa-lib jack2 ]);
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
 
             UV_PYTHON = "${python}/bin/python";
@@ -37,7 +45,8 @@
             QT_QPA_PLATFORM = "xcb";
 
             shellHook = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
-              export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath wheelLibs}:/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+              # PipeWire's libjack first, so the JACK host runs on PipeWire without `pw-jack`.
+              export LD_LIBRARY_PATH="${pkgs.pipewire.jack}/lib:${pkgs.lib.makeLibraryPath wheelLibs}:/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             '';
           };
         });

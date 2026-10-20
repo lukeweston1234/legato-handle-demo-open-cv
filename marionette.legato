@@ -1,0 +1,47 @@
+// Marionette: the left hand plays, the right hand sculpts.
+//
+// Read at startup, so re-patching only needs a restart, not a rebuild.
+
+marionette {
+    hands { smoothing: 20.0 },
+    slicer { sampler_name: "main", chans: 2, steps: 16.0, min_len: 20.0, fade: 4.0, gain: 0.7 },
+}
+
+control {
+    // A 16-step bar at 120 BPM: taps land on the next 16th.
+    clock: grid { bpm: 120.0, division: 4, steps: 16 },
+
+    // Palm height bends pitch an octave either way.
+    map: pitch { range: [0.0, 1.0], new_range: [-12.0, 12.0] },
+
+    // Wrist roll opens the filter.
+    map: cutoff { range: [0.0, 1.0], new_range: [200.0, 12000.0] },
+}
+
+audio {
+    svf: filter { chans: 2, cutoff: 12000.0, q: 0.9, type: "lowpass" },
+    plate480: verb { predelay: 20.0, decay: 0.6, damping: 0.35, mix: 0.25 },
+}
+
+// Left hand: one finger per pad, thumb tucked holds.
+hands.gate0 >> slicer.gate0
+hands.gate1 >> slicer.gate1
+hands.gate2 >> slicer.gate2
+hands.gate3 >> slicer.gate3
+hands.vel0 >> slicer.vel0
+hands.vel1 >> slicer.vel1
+hands.vel2 >> slicer.vel2
+hands.vel3 >> slicer.vel3
+hands.hold >> slicer.hold
+
+// Right hand: pinch the slices shorter, bend, and filter. Which slice each
+// finger plays is set in the viewer, not by the hand.
+hands.pinch >> slicer.len
+hands.height >> pitch >> slicer.pitch
+hands.roll >> cutoff >> filter.cutoff
+
+grid >> slicer.sync
+
+slicer >> filter >> verb
+
+{ verb }
