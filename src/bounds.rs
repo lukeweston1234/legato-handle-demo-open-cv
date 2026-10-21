@@ -292,7 +292,6 @@ pub struct Shared {
     /// Pads held down from the viewer's keyboard, one bit each: a second set
     /// of fingers that gate just like the real ones.
     held: AtomicU32,
-
     len: AtomicF32,
     playing: AtomicBool,
     pad: AtomicU32,

@@ -163,6 +163,9 @@ def main() -> None:
             cv2.imshow("Image", img)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
+            # imshow recreates a window closed with the title-bar X, so check for it.
+            if cv2.getWindowProperty("Image", cv2.WND_PROP_VISIBLE) < 1:
+                break
 
     camera.release()
     cv2.destroyAllWindows()

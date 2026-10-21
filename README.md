@@ -14,5 +14,5 @@ of unergonomic compared to a keyboard.
 To run:
 
 ```sh
-uv run tracking.py & cargo run --release <your-sample>
+uv run tracking.py & trap "kill $!" EXIT; cargo run --release <your-sample>
 ```
