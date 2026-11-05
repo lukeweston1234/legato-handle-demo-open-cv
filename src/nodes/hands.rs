@@ -13,11 +13,12 @@ pub mod port {
     pub const ROLL: usize = 12;
     pub const DEPTH: usize = 13;
     pub const FIST: usize = 14;
+    pub const PLAYING: usize = 15;
 }
 
-const OUTPUTS: [&str; 15] = [
+const OUTPUTS: [&str; 16] = [
     "gate0", "gate1", "gate2", "gate3", "vel0", "vel1", "vel2", "vel3", "hold", "pos", "pinch",
-    "height", "roll", "depth", "fist",
+    "height", "roll", "depth", "fist", "playing",
 ];
 
 /// The continuous outputs, which are slewed rather than stepped.
@@ -76,6 +77,9 @@ impl Hands {
         }
         outputs[port::HOLD].fill(bool_out(g.hold));
         outputs[port::FIST].fill(bool_out(g.fist));
+        // Any finger down or the thumb holding: someone is playing.
+        let playing = g.hold || g.gates.iter().zip(rose).any(|(&g, r)| g || r);
+        outputs[port::PLAYING].fill(bool_out(playing));
 
         let coeff = if self.smoothing_ms <= 0.0 {
             1.0

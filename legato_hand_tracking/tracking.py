@@ -1,6 +1,7 @@
 """Webcam hand tracking -> UDP packets for the Rust audio process.
 
-Each frame with at least one hand sends one datagram (little-endian):
+Every camera frame sends one datagram (little-endian), even with no hands, so
+the audio process always knows where to send its status back:
 
     u64  timestamp_us
     u8   hand_count
@@ -12,9 +13,13 @@ Each frame with at least one hand sends one datagram (little-endian):
 i.e. 9 + hand_count * 257 bytes. timestamp_us is when the frame was captured
 (monotonic, relative to tracker start). The image is mirrored, so x grows to
 the user's right and handedness matches the user's actual hands.
+
+The audio process replies to the same socket with a status packet (see
+`src/status.rs`), which the preview draws as an overlay.
 """
 
 import argparse
+from dataclasses import dataclass
 import socket
 import struct
 import threading
@@ -31,6 +36,10 @@ MODEL_PATH = Path(__file__).parent / "models" / "hand_landmarker.task"
 
 HEADER = struct.Struct("<QB")
 HAND = struct.Struct("<Bf" + "fff" * 21)
+STATUS_HEAD = struct.Struct("<BBBfffff")
+STATUS_VERSION = 2
+
+FINGER_NAMES = ["index", "middle", "ring", "pinky"]
 
 
 def ensure_model() -> Path:
@@ -48,6 +57,96 @@ def encode(result: vision.HandLandmarkerResult, timestamp_us: int) -> bytes:
         coords = [c for lm in landmarks for c in (lm.x, lm.y, lm.z)]
         out += HAND.pack(category.category_name == "Right", category.score, *coords)
     return bytes(out)
+
+
+@dataclass
+class Status:
+    curled: list[bool]
+    sounding: list[bool]
+    hold: bool
+    fist: bool
+    height: float
+    pinch: float
+    roll: float
+    pos: float
+    depth: float
+    names: list[str]
+
+
+def decode_status(buf: bytes) -> Status | None:
+    try:
+        version, curled, flags, height, pinch, roll, pos, depth = STATUS_HEAD.unpack_from(buf)
+        if version != STATUS_VERSION:
+            return None
+        at = STATUS_HEAD.size
+        names = []
+        for _ in range(4):
+            n = buf[at]
+            names.append(buf[at + 1 : at + 1 + n].decode("utf-8", "replace"))
+            at += 1 + n
+    except (struct.error, IndexError):
+        return None
+    bits = lambda b: [bool(b >> i & 1) for i in range(4)]
+    return Status(
+        bits(curled), bits(flags), bool(flags & 16), bool(flags & 32),
+        height, pinch, roll, pos, depth, names,
+    )
+
+
+class Overlay:
+    """Draws the latest status from the audio process over the preview."""
+
+    def __init__(self) -> None:
+        self.status: Status | None = None
+        self.received_at = 0.0
+
+    def update(self, status: Status, now: float) -> None:
+        self.status, self.received_at = status, now
+
+    def draw(self, img, now: float) -> None:
+        h, w = img.shape[:2]
+        st = self.status
+        if st is None or now - self.received_at > 1.0:
+            text(img, "waiting for the audio process...", (12, h - 16), 0.6, (180, 180, 180))
+            return
+
+        shade(img, 0, h - 150, w, h)
+
+        # The chord: what's sounding, and which fingers give it.
+        chord = "+".join(n for n, on in zip(st.names, st.sounding) if on) or "A minor pentatonic"
+        text(img, chord, (12, h - 108), 1.1, (255, 255, 255), 2)
+        badges = [label for label, on in (("HOLD", st.hold), ("HUSH", st.fist)) if on]
+        if badges:
+            text(img, "  ".join(badges), (12, h - 80), 0.6, (80, 200, 255), 2)
+        for i, name in enumerate(st.names):
+            x, y = 12 + i * 70, h - 62
+            colour = (80, 220, 120) if st.sounding[i] else (120, 120, 120)
+            cv2.rectangle(img, (x, y), (x + 62, y + 40), colour, cv2.FILLED if st.sounding[i] else 2)
+            ink = (20, 20, 20) if st.sounding[i] else (220, 220, 220)
+            text(img, name, (x + 8, y + 24), 0.6, ink, 2)
+            text(img, FINGER_NAMES[i], (x + 8, y + 36), 0.35, ink)
+
+        # The conducting hand, as meters down the right edge.
+        meters = [
+            ("busy", st.height), ("tone", st.pinch), ("attack", st.roll),
+            ("decay", st.pos), ("verb", st.depth),
+        ]
+        for i, (label, value) in enumerate(meters):
+            x, top, bottom = w - 186 + i * 36, 20, 200
+            shade(img, x - 4, top - 4, x + 24, bottom + 20)
+            fill_top = int(bottom - value * (bottom - top))
+            cv2.rectangle(img, (x, fill_top), (x + 20, bottom), (255, 180, 60), cv2.FILLED)
+            text(img, label, (x - 2, bottom + 14), 0.35, (230, 230, 230))
+
+
+def text(img, s: str, org, scale: float, colour, thickness: int = 1) -> None:
+    cv2.putText(img, s, org, cv2.FONT_HERSHEY_SIMPLEX, scale, colour, thickness, cv2.LINE_AA)
+
+
+def shade(img, x0: int, y0: int, x1: int, y1: int) -> None:
+    """Darkens a rectangle so the overlay reads over any background."""
+    region = img[max(y0, 0) : y1, max(x0, 0) : x1]
+    region[:] = (region * 0.45).astype(region.dtype)
 
 
 def draw(img, result: vision.HandLandmarkerResult) -> None:
@@ -126,6 +225,8 @@ def main() -> None:
     host, port = args.addr.rsplit(":", 1)
     target = (host, int(port))
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setblocking(False)
+    overlay = Overlay()
 
     options = vision.HandLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=str(ensure_model())),
@@ -148,8 +249,19 @@ def main() -> None:
             frame = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             result = landmarker.detect_for_video(frame, timestamp_us // 1000)
 
-            if result.hand_landmarks:
+            try:
                 sock.sendto(encode(result, timestamp_us), target)
+            except OSError:
+                pass  # the audio process isn't up yet
+
+            # Keep only the newest status; older ones are already stale.
+            while True:
+                try:
+                    status = decode_status(sock.recv(4096))
+                except (BlockingIOError, ConnectionRefusedError):
+                    break
+                if status is not None:
+                    overlay.update(status, time.monotonic())
 
             if args.no_preview:
                 continue
@@ -159,6 +271,7 @@ def main() -> None:
             prev = now
             age_ms = (now - captured_at) * 1000
             draw(img, result)
+            overlay.draw(img, now)
             cv2.putText(img, f"{fps:.0f} fps  {age_ms:.0f} ms", (10, 40), cv2.FONT_HERSHEY_PLAIN, 2, (255, 0, 255), 2)
             cv2.imshow("Image", img)
             if cv2.waitKey(1) & 0xFF == ord("q"):

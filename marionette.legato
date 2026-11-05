@@ -1,37 +1,227 @@
+// Marionette: a generative band that the hands conduct.
+//
+// Five voices pick their own notes from random sources. `harmony` snaps them
+// onto the chord the left hand holds (index Am9, middle Fmaj9, ring Cmaj9,
+// pinky G9; several fingers sound together, a tucked thumb latches), or onto
+// A minor pentatonic when no finger is curled, so it plays on its own between
+// visitors.
+//
+// The right hand conducts: height is how busy the band is (from a sparse
+// drift to every voice on every step), pinch opens the tone, wrist roll and
+// side-to-side set the arp's attack and decay, leaning in drowns it in
+// reverb, and a fist hushes everyone but the bass.
+
+patch synth(
+    attack = 5.0,
+    decay = 200.0,
+    sustain = 0.5,
+    release = 400.0,
+    cutoff = 3000.0,
+    level = 0.15,
+    pan = 0.5
+) {
+    in freq gate
+
+    audio {
+        saw { chans: 1 },
+        svf { chans: 1, cutoff: $cutoff, q: 0.6, type: "lowpass" },
+        adsr { attack: $attack, decay: $decay, sustain: $sustain, release: $release, chans: 1 },
+        mult: level { val: $level },
+        pan { pan: $pan },
+    }
+
+    freq >> saw
+    gate >> adsr.gate
+    saw >> svf >> adsr[1]
+    adsr >> level >> pan
+
+    { pan }
+}
+
+patch bell(
+    decay = 700.0,
+    level = 0.2,
+    pan = 0.5
+) {
+    in freq gate
+
+    audio {
+        sine { chans: 1 },
+        adsr { attack: 2.0, decay: $decay, sustain: 0.0, release: $decay, chans: 1 },
+        mult: level { val: $level },
+        pan { pan: $pan },
+    }
+
+    freq >> sine
+    gate >> adsr.gate
+    sine >> adsr[1]
+    adsr >> level >> pan
+
+    { pan }
+}
+
+// The arp's envelope times are inputs, so the right hand can shape it.
+patch plucked(
+    cutoff = 4000.0,
+    level = 0.15,
+    pan = 0.5
+) {
+    in freq gate attack decay
+
+    audio {
+        saw { chans: 1 },
+        svf { chans: 1, cutoff: $cutoff, q: 0.8, type: "lowpass" },
+        mult: level { val: $level },
+        pan { pan: $pan },
+    }
+
+    marionette {
+        pluck { },
+    }
+
+    freq >> saw
+    saw >> svf >> pluck.in
+    gate >> pluck.gate
+    attack >> pluck.attack
+    decay >> pluck.decay
+    pluck >> level >> pan
+
+    { pan }
+}
+
 marionette {
     hands { smoothing: 20.0 },
-    slicer { sampler_name: "main", chans: 2, steps: 16.0, min_len: 20.0, fade: 4.0, gain: 0.7 },
+    // Voices: 0 bass, 1-2 pads, 3 chime, 4 arp. The bass takes chord roots.
+    harmony { voices: 5, root: 57, roots: 1 },
+}
+
+patches {
+    synth: bass { attack: 6.0, decay: 500.0, sustain: 0.5, release: 400.0, cutoff: 700.0, level: 0.3 },
+    synth: pad_a { attack: 900.0, decay: 1500.0, sustain: 0.7, release: 2500.0, cutoff: 1400.0, level: 0.12, pan: 0.25 },
+    synth: pad_b { attack: 1200.0, decay: 1500.0, sustain: 0.7, release: 3000.0, cutoff: 1200.0, level: 0.12, pan: 0.75 },
+    bell: chime { decay: 700.0, level: 0.16, pan: 0.15 },
+    plucked: arp { cutoff: 4000.0, level: 0.14, pan: 0.85 },
 }
 
 control {
-    clock: grid { bpm: 120.0, division: 4, steps: 16 },
-    map: pitch { range: [0.0, 1.0], new_range: [-12.0, 12.0] },
-    // Wrist roll opens the filter.
-    map: cutoff { range: [0.0, 1.0], new_range: [200.0, 12000.0] },
+    clock: beat { bpm: 120.0, division: 1, steps: 1 },
+    clock: sixteenth { bpm: 120.0, division: 4, steps: 1 },
+
+    // Height drives how busy everything is.
+    // How likely the pads and chime are to take a new note each step...
+    map: busy { range: [0.0, 1.0], new_range: [0.1, 1.0] },
+    // ...and how fast the pads step, in ms.
+    map: pad_a_rate { range: [0.0, 1.0], new_range: [3000.0, 300.0] },
+    map: pad_b_rate { range: [0.0, 1.0], new_range: [3800.0, 420.0] },
+    // The bass from about one note a bar to one every beat.
+    map: bass_busy { range: [0.0, 1.0], new_range: [0.2, 0.95] },
+    // The arp plays while the left hand does, from a scatter to every 16th.
+    map: arp_busy { range: [0.0, 1.0], new_range: [0.3, 1.0] },
+    // A fist hushes everything but the bass.
+    map: open { range: [0.0, 1.0], new_range: [1.0, 0.0] },
+    map: bright { range: [0.0, 1.0], new_range: [250.0, 9000.0] },
+    // The arp's envelope, in ms: roll for attack, side-to-side for decay.
+    map: arp_attack { range: [0.0, 1.0], new_range: [1.0, 300.0] },
+    map: arp_decay { range: [0.0, 1.0], new_range: [50.0, 1500.0] },
+    // Leaning in crossfades towards the reverb.
+    map: wet { range: [0.0, 1.0], new_range: [0.15, 0.8] },
+    map: dry { range: [0.0, 1.0], new_range: [1.0, 0.45] },
+}
+
+modular {
+    random: bass_notes { range: [33.0, 47.0] },
+    random: pad_a_notes { range: [52.0, 69.0] },
+    random: pad_b_notes { range: [55.0, 74.0] },
+    random: chime_notes { range: [69.0, 88.0] },
+    random: arp_notes { range: [60.0, 84.0] },
+
+    trig_to_gate: bass_gate { gate_time: 350.0 },
+    trig_to_gate: pad_a_gate { gate_time: 1500.0 },
+    trig_to_gate: pad_b_gate { gate_time: 2200.0 },
+    trig_to_gate: chime_gate { gate_time: 30.0 },
+    trig_to_gate: arp_gate { gate_time: 30.0 },
 }
 
 audio {
-    svf: filter { chans: 2, cutoff: 12000.0, q: 0.9, type: "lowpass" },
-    plate480: verb { predelay: 20.0, decay: 0.6, damping: 0.35, mix: 0.25 },
+    mult: hush { val: 1.0 },
+    mult: sparse { val: 0.6 },
+    mult: arp_playing { val: 0.0 },
+    mult: arp_hush { val: 1.0 },
+
+    track_mixer: band { tracks: 5, chans_per_track: 2 },
+    svf: tone { chans: 2, cutoff: 4000.0, q: 0.9, type: "lowpass" },
+
+    // A fully wet plate, crossfaded with the dry band by `wet` and `dry`.
+    // `gain` is linear at these levels and soft-clips past them.
+    plate480: verb { predelay: 40.0, decay: 0.88, damping: 0.35, mix: 1.0 },
+    gain: verb_level { val: 0.0, chans: 2 },
+    gain: dry_level { val: 1.0, chans: 2 },
+    track_mixer: bus { tracks: 2, chans_per_track: 2 },
+
+    // Up to a sensible level; tanh rounds off the rare pile-up.
+    gain: master { val: 2.2, chans: 2 },
 }
 
-// Left hand: one finger per pad, thumb tucked holds.
-hands.gate0 >> slicer.gate0
-hands.gate1 >> slicer.gate1
-hands.gate2 >> slicer.gate2
-hands.gate3 >> slicer.gate3
-hands.vel0 >> slicer.vel0
-hands.vel1 >> slicer.vel1
-hands.vel2 >> slicer.vel2
-hands.vel3 >> slicer.vel3
-hands.hold >> slicer.hold
+// The left hand chooses the harmony.
+hands.gate0 >> harmony.gate0
+hands.gate1 >> harmony.gate1
+hands.gate2 >> harmony.gate2
+hands.gate3 >> harmony.gate3
+hands.hold >> harmony.hold
 
-hands.pinch >> slicer.len
-hands.height >> pitch >> slicer.pitch
-hands.roll >> cutoff >> filter.cutoff
+// Clocks step the bass, chime and arp; the pads run on their own timers.
+beat >> bass_notes.trig
+sixteenth >> chime_notes.trig
+sixteenth >> arp_notes.trig
 
-grid >> slicer.sync
+bass_notes.stepped >> harmony.pitch0
+pad_a_notes.stepped >> harmony.pitch1
+pad_b_notes.stepped >> harmony.pitch2
+chime_notes.stepped >> harmony.pitch3
+arp_notes.stepped >> harmony.pitch4
 
-slicer >> filter >> verb
+harmony.freq0 >> bass.freq
+harmony.freq1 >> pad_a.freq
+harmony.freq2 >> pad_b.freq
+harmony.freq3 >> chime.freq
+harmony.freq4 >> arp.freq
 
-{ verb }
+bass_notes.trig >> bass_gate >> bass.gate
+pad_a_notes.trig >> pad_a_gate >> pad_a.gate
+pad_b_notes.trig >> pad_b_gate >> pad_b.gate
+chime_notes.trig >> chime_gate >> chime.gate
+arp_notes.trig >> arp_gate >> arp.gate
+
+// The right hand conducts.
+hands.height >> busy >> hush[0]
+hands.fist >> open >> hush.val
+hush >> pad_a_notes.prob
+hush >> pad_b_notes.prob
+hush >> sparse >> chime_notes.prob
+hands.height >> pad_a_rate >> pad_a_notes.rate
+hands.height >> pad_b_rate >> pad_b_notes.rate
+hands.height >> bass_busy >> bass_notes.prob
+
+hands.height >> arp_busy >> arp_playing[0]
+hands.playing >> arp_playing.val
+arp_playing >> arp_hush[0]
+open >> arp_hush.val
+arp_hush >> arp_notes.prob
+
+hands.roll >> arp_attack >> arp.attack
+hands.pos >> arp_decay >> arp.decay
+hands.pinch >> bright >> tone.cutoff
+hands.depth >> wet >> verb_level.val
+hands.depth >> dry >> dry_level.val
+
+bass >> band[0..2]
+pad_a >> band[2..4]
+pad_b >> band[4..6]
+chime >> band[6..8]
+arp >> band[8..10]
+
+band >> tone >> dry_level >> bus[0..2]
+tone >> verb >> verb_level >> bus[2..4]
+bus >> master
+
+{ master }

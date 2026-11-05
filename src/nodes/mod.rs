@@ -1,5 +1,7 @@
 mod hands;
-mod slicer;
+pub mod harmony;
+mod pluck;
 
 pub use hands::Hands;
-pub use slicer::Slicer;
+pub use harmony::Harmony;
+pub use pluck::Pluck;

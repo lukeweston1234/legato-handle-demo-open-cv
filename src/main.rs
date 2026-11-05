@@ -1,49 +1,50 @@
 //! Marionette's audio process: hands in over UDP from `tracking.py`, sound out
-//! over JACK, and a viewer window for tuning the slicer's bounds.
+//! over JACK, and a status packet back to the tracker for its overlay.
 //!
-//!     cargo run --release -- <sample> [--graph marionette.legato] [--addr 127.0.0.1:9870] [--play-right] [--no-ui]
+//!     cargo run --release -- [--graph marionette.legato] [--addr 127.0.0.1:9870] [--play-right]
+//!
+//! There is no window here: the audio thread and one network thread are all
+//! that run, so a small box keeps its whole budget for the graph.
 
 use std::{
     error::Error,
     io::{ErrorKind, Write},
-    net::UdpSocket,
-    path::{Path, PathBuf},
+    net::{SocketAddr, UdpSocket},
+    path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
-use legato::{prelude::*, resources::buffer::decode_with_ffmpeg};
+use legato::prelude::*;
 use legato_hand_tracking::{
-    Frame, Handedness,
-    bounds::Preset,
-    build,
+    Frame, Handedness, build,
     gesture::{Gesture, GestureTracker, PADS, Tuning},
-    nodes::{Hands, Slicer},
-    viewer::{self, ViewerArgs},
+    nodes::{Hands, Harmony, harmony},
+    status::Status,
 };
 
-/// `tracking.py` only sends frames with a hand in them, so silence this long
-/// means both hands have left the camera.
+/// `tracking.py` sends every camera frame, hands or not, so silence this
+/// long means the tracker has stopped.
 const LOST_AFTER: Duration = Duration::from_millis(120);
 const METER_EVERY: Duration = Duration::from_millis(50);
+/// About the camera's frame rate; the overlay can't show more than that.
+const STATUS_EVERY: Duration = Duration::from_millis(30);
 
 struct Args {
-    sample: PathBuf,
     graph: PathBuf,
     addr: String,
     play_hand: Handedness,
-    ui: bool,
 }
 
 impl Args {
-    const USAGE: &str = "usage: legato-hand-tracking <sample> [--graph FILE] [--addr HOST:PORT] [--play-right] [--no-ui]";
+    const USAGE: &str =
+        "usage: legato-hand-tracking [--graph FILE] [--addr HOST:PORT] [--play-right]";
 
     fn parse() -> Result<Self, String> {
         let mut args = std::env::args().skip(1);
-        let mut sample = None;
         let mut graph = PathBuf::from("marionette.legato");
         let mut addr = String::from("127.0.0.1:9870");
         let mut play_hand = Handedness::Left;
-        let mut ui = true;
 
         while let Some(arg) = args.next() {
             let mut value = || {
@@ -54,19 +55,15 @@ impl Args {
                 "--graph" => graph = value()?.into(),
                 "--addr" => addr = value()?,
                 "--play-right" => play_hand = Handedness::Right,
-                "--no-ui" => ui = false,
                 "-h" | "--help" => return Err(Self::USAGE.into()),
-                _ if sample.is_none() && !arg.starts_with('-') => sample = Some(arg.into()),
                 _ => return Err(format!("unexpected argument '{arg}'\n{}", Self::USAGE)),
             }
         }
 
         Ok(Self {
-            sample: sample.ok_or(Self::USAGE)?,
             graph,
             addr,
             play_hand,
-            ui,
         })
     }
 }
@@ -83,8 +80,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let config = Config {
         sample_rate: env_or("LEGATO_SAMPLE_RATE", 48_000),
-        // Small blocks keep gates tight; the camera is the real latency.
-        block_size: env_or("LEGATO_BLOCK_SIZE", 256),
+        block_size: env_or("LEGATO_BLOCK_SIZE", 1024),
         channels: 2,
         rt_capacity: 0,
     };
@@ -95,24 +91,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map_err(|e| format!("{} did not build: {e:?}", args.graph.display()))?;
 
     let hands = frontend.take_handle_of::<Hands>("hands")?;
-    let slicer = frontend.take_handle_of::<Slicer>("slicer")?;
-    let sample_rate = config.sample_rate as u32;
-    frontend.load_sample("main", Path::new(&args.sample), 2, sample_rate)?;
-
-    // The viewer draws its own mono copy; the graph's buffer is out of reach.
-    let mono = decode_with_ffmpeg(&args.sample, 1, sample_rate)?;
-    let secs = mono.len_samples() as f32 / sample_rate as f32;
-    let (preset, saved) = viewer::load_preset(&args.sample, slicer.bounds(), secs)?;
-    slicer.set_bounds(preset.bounds);
-    if saved {
-        eprintln!("bounds from {}", Preset::path_for(&args.sample).display());
-    }
+    let harmony = frontend.take_handle_of::<Harmony>("harmony")?;
 
     let socket = UdpSocket::bind(&args.addr)?;
     socket.set_read_timeout(Some(LOST_AFTER))?;
     let tracker = GestureTracker::new(Tuning::new(args.play_hand));
     eprintln!("listening for hands on {}", args.addr);
-    std::thread::spawn(move || listen(socket, tracker, hands));
+    std::thread::spawn(move || listen(socket, tracker, hands, harmony));
 
     let host = cpal::host_from_id(cpal::HostId::Jack)?;
     let interface = AudioInterface::builder(&host, config)
@@ -128,38 +113,36 @@ fn main() -> Result<(), Box<dyn Error>> {
             )
         })?;
 
-    if !args.ui {
-        interface.run_forever();
-    }
-    // Windowing wants the main thread; the audio runs until the window closes.
-    viewer::run(ViewerArgs {
-        frontend,
-        shared: slicer,
-        clock: "grid".into(),
-        mono: mono.data.to_vec(),
-        sample_rate: sample_rate as f32,
-        sample: args.sample,
-        preset,
-        saved,
-    })?;
-    drop(interface);
-    Ok(())
+    // Nothing else needs the main thread; the network thread runs on its own.
+    interface.run_forever();
 }
 
-fn listen(socket: UdpSocket, mut tracker: GestureTracker, mut tx: rtrb::Producer<Gesture>) {
+fn listen(
+    socket: UdpSocket,
+    mut tracker: GestureTracker,
+    mut tx: rtrb::Producer<Gesture>,
+    harmony: Arc<harmony::Shared>,
+) {
     // Largest frame we expect is a handful of hands; 4 KiB is plenty.
     let mut buf = [0u8; 4096];
     let mut meter = Meter::default();
+    // The tracker's own socket, which is where its overlay listens.
+    let mut peer: Option<SocketAddr> = None;
+    let mut status = Vec::new();
+    let mut sent: Option<Instant> = None;
 
     loop {
-        let gesture = match socket.recv(&mut buf) {
-            Ok(len) => match Frame::decode(&buf[..len]) {
-                Ok(frame) => tracker.update(&frame),
-                Err(e) => {
-                    eprintln!("bad packet: {e}");
-                    continue;
+        let gesture = match socket.recv_from(&mut buf) {
+            Ok((len, from)) => {
+                peer = Some(from);
+                match Frame::decode(&buf[..len]) {
+                    Ok(frame) => tracker.update(&frame),
+                    Err(e) => {
+                        eprintln!("bad packet: {e}");
+                        continue;
+                    }
                 }
-            },
+            }
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                 tracker.lost()
             }
@@ -170,7 +153,16 @@ fn listen(socket: UdpSocket, mut tracker: GestureTracker, mut tx: rtrb::Producer
         };
         // Full means the audio thread has stalled; a newer gesture follows shortly.
         let _ = tx.push(gesture);
-        meter.show(&gesture);
+        meter.show(&gesture, &harmony);
+
+        if let Some(peer) = peer
+            && sent.is_none_or(|t| t.elapsed() >= STATUS_EVERY)
+        {
+            sent = Some(Instant::now());
+            Status::new(&gesture, &harmony).encode(&mut status);
+            // The tracker may have gone; it will say hello again when it's back.
+            let _ = socket.send_to(&status, peer);
+        }
     }
 }
 
@@ -181,26 +173,33 @@ struct Meter {
 }
 
 impl Meter {
-    fn show(&mut self, g: &Gesture) {
+    fn show(&mut self, g: &Gesture, harmony: &harmony::Shared) {
         if self.last.is_some_and(|t| t.elapsed() < METER_EVERY) {
             return;
         }
         self.last = Some(Instant::now());
 
-        let pads: String = (0..PADS)
-            .map(|p| if g.gates[p] { '■' } else { '·' })
+        let sounding = harmony.fingers();
+        let chord: Vec<&str> = (0..PADS)
+            .filter(|&f| sounding[f])
+            .map(|f| harmony.names()[f].as_str())
             .collect();
+        let chord = if chord.is_empty() {
+            "pentatonic".to_string()
+        } else {
+            chord.join("+")
+        };
         let mut err = std::io::stderr().lock();
         let _ = write!(
             err,
-            "\r\x1b[2Kpads {pads} {hold}  pos {:.2}  len {:.2}  height {:.2}  roll {:.2}  depth {:.2}{fist}",
-            g.pos,
-            g.pinch,
+            "\r\x1b[2K{chord:<24}{hold}  busy {:.2}  tone {:.2}  attack {:.2}  decay {:.2}  verb {:.2}{fist}",
             g.height,
+            g.pinch,
             g.roll,
+            g.pos,
             g.depth,
-            hold = if g.hold { "hold" } else { "    " },
-            fist = if g.fist { "  fist" } else { "" },
+            hold = if harmony.holding() { "hold" } else { "    " },
+            fist = if g.fist { "  hush" } else { "" },
         );
         let _ = err.flush();
     }
