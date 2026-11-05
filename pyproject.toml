@@ -1,3 +1,7 @@
+[build-system]
+requires = ["uv_build>=0.13.0,<0.14"]
+build-backend = "uv_build"
+
 [project]
 name = "legato-hand-tracking"
 version = "0.1.0"
@@ -6,3 +10,10 @@ dependencies = [
     "mediapipe>=1.1",
     "opencv-contrib-python>=4.10",
 ]
+
+[project.scripts]
+legato-hand-tracking = "legato_hand_tracking.tracking:main"
+
+[tool.uv.build-backend]
+module-root = ""
+module-name = "legato_hand_tracking"
